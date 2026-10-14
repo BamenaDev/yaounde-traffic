@@ -28,10 +28,27 @@ type Destination = {
   lng: number;
 };
 
+type NavigationStep = {
+  instruction: string;
+  distanceMeters: number;
+  maneuver?: string;
+
+  startLocation?: {
+    lat: number;
+    lng: number;
+  };
+
+  endLocation?: {
+    lat: number;
+    lng: number;
+  };
+};
+
 type RouteInfo = {
   index: number;
   distanceKm: number;
   durationMinutes: number;
+  steps: NavigationStep[];
 };
 
 const YAOUNDE: Position = {
@@ -40,61 +57,14 @@ const YAOUNDE: Position = {
 };
 
 /*
-  Distance approximative entre deux positions GPS.
-*/
-function distanceBetween(
-  pointA: Position,
-  pointB: Position
-) {
-  const earthRadius = 6371000;
-
-  const lat1 =
-    (pointA.lat * Math.PI) / 180;
-
-  const lat2 =
-    (pointB.lat * Math.PI) / 180;
-
-  const deltaLat =
-    ((pointB.lat - pointA.lat) *
-      Math.PI) /
-    180;
-
-  const deltaLng =
-    ((pointB.lng - pointA.lng) *
-      Math.PI) /
-    180;
-
-  const a =
-    Math.sin(deltaLat / 2) *
-      Math.sin(deltaLat / 2) +
-    Math.cos(lat1) *
-      Math.cos(lat2) *
-      Math.sin(deltaLng / 2) *
-      Math.sin(deltaLng / 2);
-
-  const c =
-    2 *
-    Math.atan2(
-      Math.sqrt(a),
-      Math.sqrt(1 - a)
-    );
-
-  return earthRadius * c;
-}
-
-/*
-  Affichage du trafic.
+  Couche trafic Google Maps
 */
 function TrafficLayer() {
   const map = useMap();
-
-  const mapsLibrary =
-    useMapsLibrary("maps");
+  const mapsLibrary = useMapsLibrary("maps");
 
   useEffect(() => {
-    if (!map || !mapsLibrary) {
-      return;
-    }
+    if (!map || !mapsLibrary) return;
 
     const trafficLayer =
       new mapsLibrary.TrafficLayer();
@@ -110,34 +80,32 @@ function TrafficLayer() {
 }
 
 /*
-  La carte suit l'utilisateur.
+  La carte suit la position GPS.
+  Aucun recalcul d'itinéraire ici.
 */
 function FollowUser({
   position,
+  enabled,
 }: {
   position: Position | null;
+  enabled: boolean;
 }) {
   const map = useMap();
 
   useEffect(() => {
-    if (!map || !position) {
+    if (!map || !position || !enabled) {
       return;
     }
 
     map.panTo(position);
-  }, [map, position]);
+  }, [map, position, enabled]);
 
   return null;
 }
 
 type RouteLayerProps = {
-  position: Position | null;
+  startPosition: Position | null;
   destination: Destination | null;
-
-  /*
-    Augmente à chaque clic sur
-    "Rechercher un itinéraire".
-  */
   routeRequestId: number;
 
   onRoutesCalculated: (
@@ -147,66 +115,39 @@ type RouteLayerProps = {
   onRouteError: (
     message: string
   ) => void;
+
+  onLoadingChange: (
+    loading: boolean
+  ) => void;
 };
 
 function RouteLayer({
-  position,
+  startPosition,
   destination,
   routeRequestId,
   onRoutesCalculated,
   onRouteError,
+  onLoadingChange,
 }: RouteLayerProps) {
   const map = useMap();
 
   const routesLibrary =
     useMapsLibrary("routes");
 
-  /*
-    Routes actuellement affichées.
-  */
   const polylinesRef =
     useRef<google.maps.Polyline[]>([]);
 
-  /*
-    Dernière position où un calcul
-    a réellement réussi.
-  */
-  const lastSuccessfulPositionRef =
-    useRef<Position | null>(null);
-
-  /*
-    Permet de reconnaître un nouveau
-    clic manuel.
-  */
-  const lastManualRequestRef =
+  const lastProcessedRequest =
     useRef(0);
 
-  /*
-    Évite qu'une ancienne requête
-    écrase une requête plus récente.
-  */
-  const requestCounterRef =
+  const requestCounter =
     useRef(0);
-
-  /*
-    Indique qu'au moins un trajet
-    valide a déjà été trouvé.
-  */
-  const hasSuccessfulRouteRef =
-    useRef(false);
 
   /*
     Nouvelle destination.
   */
   useEffect(() => {
-    lastSuccessfulPositionRef.current =
-      null;
-
-    hasSuccessfulRouteRef.current =
-      false;
-
-    lastManualRequestRef.current =
-      0;
+    lastProcessedRequest.current = 0;
 
     polylinesRef.current.forEach(
       (polyline) => {
@@ -218,7 +159,7 @@ function RouteLayer({
   }, [destination]);
 
   /*
-    Nettoyage.
+    Nettoyage général.
   */
   useEffect(() => {
     return () => {
@@ -234,7 +175,7 @@ function RouteLayer({
     if (
       !map ||
       !routesLibrary ||
-      !position ||
+      !startPosition ||
       !destination ||
       routeRequestId === 0
     ) {
@@ -242,58 +183,36 @@ function RouteLayer({
     }
 
     /*
-      Vérifie si le calcul vient
-      d'un clic manuel.
-    */
-    const isManualRequest =
-      routeRequestId !==
-      lastManualRequestRef.current;
-
-    /*
-      Si ce n'est pas un clic manuel,
-      il s'agit d'une mise à jour GPS.
+      Un même clic ne doit jamais
+      créer plusieurs requêtes.
     */
     if (
-      !isManualRequest &&
-      lastSuccessfulPositionRef.current
- ) {
-      const movedDistance =
-        distanceBetween(
-          lastSuccessfulPositionRef.current,
-          position
-        );
-
-      /*
-        On ne recalcule pas pour
-        quelques mètres de variation GPS.
-      */
-      if (movedDistance < 50) {
-        return;
-      }
+      routeRequestId ===
+      lastProcessedRequest.current
+    ) {
+      return;
     }
 
-    if (isManualRequest) {
-      lastManualRequestRef.current =
-        routeRequestId;
-    }
+    lastProcessedRequest.current =
+      routeRequestId;
 
-    /*
-      Identifiant unique de cette requête.
-    */
-    requestCounterRef.current += 1;
+    requestCounter.current += 1;
 
     const currentRequest =
-      requestCounterRef.current;
+      requestCounter.current;
 
     const calculateRoutes =
       async () => {
+        onLoadingChange(true);
+        onRouteError("");
+
         try {
           const request:
             google.maps.routes.ComputeRoutesRequest =
           {
             origin: {
-              lat: position.lat,
-              lng: position.lng,
+              lat: startPosition.lat,
+              lng: startPosition.lng,
             },
 
             destination: {
@@ -301,8 +220,7 @@ function RouteLayer({
               lng: destination.lng,
             },
 
-            travelMode:
-              "DRIVING",
+            travelMode: "DRIVING",
 
             routingPreference:
               "TRAFFIC_AWARE_OPTIMAL",
@@ -310,12 +228,14 @@ function RouteLayer({
             computeAlternativeRoutes:
               true,
 
-            fields: [
-              "path",
-              "distanceMeters",
-              "durationMillis",
-              "viewport",
-            ],
+           fields: [
+  "path",
+  "distanceMeters",
+  "durationMillis",
+  "viewport",
+  "legs",
+  
+],
           };
 
           const { routes } =
@@ -324,12 +244,11 @@ function RouteLayer({
             );
 
           /*
-            Une requête plus récente
-            existe déjà.
+            Une recherche plus récente existe.
           */
           if (
             currentRequest !==
-            requestCounterRef.current
+            requestCounter.current
           ) {
             return;
           }
@@ -338,35 +257,31 @@ function RouteLayer({
             !routes ||
             routes.length === 0
           ) {
-            if (
-              !hasSuccessfulRouteRef.current
-            ) {
-              onRouteError(
-                "Aucun itinéraire trouvé."
-              );
-            }
+ onRouteError(
+              "Aucun itinéraire trouvé."
+            );
 
             return;
           }
 
           /*
-            Classer les routes par durée.
+            Trier les itinéraires
+            du plus rapide au plus lent.
           */
           const sortedRoutes =
             [...routes].sort(
-              (routeA, routeB) =>
-                (routeA.durationMillis ??
+              (a, b) =>
+                (a.durationMillis ??
                   Infinity) -
-                (routeB.durationMillis ??
+                (b.durationMillis ??
                   Infinity)
             );
 
-          const routeInfos:
-            RouteInfo[] = [];
+          const routeInfos: RouteInfo[] =
+            [];
 
           const newPolylines:
-            google.maps.Polyline[] =
-            [];
+            google.maps.Polyline[] = [];
 
           sortedRoutes.forEach(
             (route, index) => {
@@ -384,12 +299,10 @@ function RouteLayer({
                     strokeOpacity:
                       index === 0
                         ? 1
-                        : 0.4,
+                        : 0.35,
                   });
 
-                  polyline.setMap(
-                    map
-                  );
+                  polyline.setMap(map);
                 }
               );
 
@@ -397,96 +310,89 @@ function RouteLayer({
                 ...polylines
               );
 
-              routeInfos.push({
-                index,
+  const navigationSteps: NavigationStep[] = [];
 
-                distanceKm:
-                  (route.distanceMeters ??
-                    0) / 1000,
+route.legs?.forEach((leg) => {
+  leg.steps?.forEach((step) => {
+    navigationSteps.push({
+      instruction:
+        translateInstruction(step.instructions ?? "") ?? "",
 
-                durationMinutes:
-                  (route.durationMillis ??
-                    0) / 60000,
-              });
+      distanceMeters:
+        step.distanceMeters ?? 0,
+
+      maneuver:
+        step.maneuver ?? undefined,
+
+      startLocation: step.startLocation
+        ? {
+            lat: step.startLocation.lat,
+            lng: step.startLocation.lng,
+          }
+        : undefined,
+
+      endLocation: step.endLocation
+        ? {
+            lat: step.endLocation.lat,
+            lng: step.endLocation.lng,
+          }
+        : undefined,
+    });
+  });
+});
+routeInfos.push({
+  index,
+
+  distanceKm:
+    (route.distanceMeters ?? 0) / 1000,
+
+  durationMinutes:
+    (route.durationMillis ?? 0) / 60000,
+
+  steps: navigationSteps,
+});
             }
           );
 
           /*
-            Maintenant seulement,
-            on supprime les anciennes
-            routes.
-
-            Ainsi, si Google échoue,
-            l'ancien trajet reste affiché.
+            On enlève les anciens trajets
+            seulement après un nouveau succès.
           */
           polylinesRef.current.forEach(
             (polyline) => {
-              polyline.setMap(
-                null
-              );
+              polyline.setMap(null);
             }
           );
 
           polylinesRef.current =
             newPolylines;
 
-          /*
-            La position est enregistrée
-            seulement après un succès.
-          */
-          lastSuccessfulPositionRef.current =
-            {
-              ...position,
-            };
-
-          hasSuccessfulRouteRef.current =
-            true;
- onRoutesCalculated(
+          onRoutesCalculated(
             routeInfos
           );
 
-          /*
-            Ajuster la carte surtout
-            lors d'une recherche manuelle.
-          */
           if (
-            isManualRequest &&
-            sortedRoutes[0]
-              .viewport
+            sortedRoutes[0]?.viewport
           ) {
             map.fitBounds(
-              sortedRoutes[0]
-                .viewport
+              sortedRoutes[0].viewport
             );
           }
         } catch (error) {
-          /*
-            Ignorer l'erreur d'une ancienne
-            requête devenue inutile.
-          */
-          if (
-            currentRequest !==
-            requestCounterRef.current
-          ) {
-            return;
-          }
-
           console.error(
             "Erreur Routes API :",
             error
           );
 
-          /*
-            Si on avait déjà un trajet,
-            on le conserve au lieu
-            d'afficher une erreur rouge.
-          */
+          onRouteError(
+            "Impossible de calculer les itinéraires."
+          );
+        } finally {
           if (
-            !hasSuccessfulRouteRef.current
+            currentRequest ===
+            requestCounter.current
           ) {
-            onRouteError(
-              "Impossible de calculer les itinéraires."
-            );
+            onLoadingChange(false);
           }
         }
       };
@@ -495,14 +401,56 @@ function RouteLayer({
   }, [
     map,
     routesLibrary,
-    position,
+    startPosition,
     destination,
     routeRequestId,
     onRoutesCalculated,
     onRouteError,
+    onLoadingChange,
   ]);
 
   return null;
+}
+
+function translateInstruction(instruction: string): string {
+  return instruction
+    .replace(/^Head northwest/i, "Dirigez-vous vers le nord-ouest")
+    .replace(/^Head northeast/i, "Dirigez-vous vers le nord-est")
+    .replace(/^Head southwest/i, "Dirigez-vous vers le sud-ouest")
+    .replace(/^Head southeast/i, "Dirigez-vous vers le sud-est")
+    .replace(/^Head north/i, "Dirigez-vous vers le nord")
+    .replace(/^Head south/i, "Dirigez-vous vers le sud")
+    .replace(/^Head east/i, "Dirigez-vous vers l’est")
+    .replace(/^Head west/i, "Dirigez-vous vers l’ouest")
+    .replace(/^Turn left/i, "Tournez à gauche")
+    .replace(/^Turn right/i, "Tournez à droite")
+    .replace(/^Slight left/i, "Tournez légèrement à gauche")
+    .replace(/^Slight right/i, "Tournez légèrement à droite")
+    .replace(/^Make a U-turn/i, "Faites demi-tour")
+    .replace(
+      /^At the roundabout, take the 1st exit/i,
+      "Au rond-point, prenez la 1re sortie"
+    )
+    .replace(
+      /^At the roundabout, take the 2nd exit/i,
+      "Au rond-point, prenez la 2e sortie"
+    )
+    .replace(
+      /^At the roundabout, take the 3rd exit/i,
+      "Au rond-point, prenez la 3e sortie"
+    )
+    .replace(
+      /^At the roundabout, take the 4th exit/i,
+      "Au rond-point, prenez la 4e sortie"
+    )
+    .replace(
+      /Destination will be on the left/i,
+      "La destination se trouvera sur votre gauche"
+    )
+    .replace(
+      /Destination will be on the right/i,
+      "La destination se trouvera sur votre droite"
+    );
 }
 
 export default function Home() {
@@ -510,10 +458,24 @@ export default function Home() {
     process.env
       .NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
 
+  /*
+    Position GPS actuelle.
+    Elle évolue pendant le déplacement.
+  */
   const [position, setPosition] =
-    useState<Position | null>(
-      null
-    );
+    useState<Position | null>(null);
+
+    const [activeStepIndex, setActiveStepIndex] = useState<number>(0);
+
+  /*
+    Position figée au moment où
+    l'utilisateur demande un calcul.
+  */
+  const [
+    routeStartPosition,
+    setRouteStartPosition,
+  ] =
+    useState<Position | null>(null);
 
   const [
     destination,
@@ -526,9 +488,10 @@ export default function Home() {
   const [
     locationStatus,
     setLocationStatus,
-  ] = useState(
-    "Recherche de votre position..."
-  );
+  ] =
+    useState(
+      "Recherche de votre position..."
+    );
 
   const [
     routesInfo,
@@ -539,40 +502,54 @@ export default function Home() {
   const [
     routeError,
     setRouteError,
-  ] = useState("");
+  ] =
+    useState("");
 
-  /*
-    Chaque clic augmente ce numéro.
-    Donc même sans bouger,
-    une nouvelle recherche fonctionne.
-  */
   const [
     routeRequestId,
     setRouteRequestId,
-  ] = useState(0);
+  ] =
+    useState(0);
+
+  const [
+    routeLoading,
+    setRouteLoading,
+  ] =
+    useState(false);
 
   /*
-    GPS temps réel.
+    Active le suivi visuel de la voiture.
+  */
+  const [
+    followPosition,
+    setFollowPosition,
+  ] =
+    useState(true);
+
+  /*
+    Heure du dernier calcul.
+  */
+  const [
+    lastCalculation,
+    setLastCalculation,
+  ] =
+    useState<Date | null>(null);
+
+  /*
+    GPS en temps réel.
   */
   useEffect(() => {
-    if (
-      !navigator.geolocation
-    ) {
+    if (!navigator.geolocation) {
       setLocationStatus(
-        "La localisation GPS n'est pas disponible."
+        "GPS non disponible."
       );
-
-      return;
+ return;
     }
-
-    setLocationStatus(
-      "Recherche de votre position..."
-    );
 
     const watchId =
       navigator.geolocation.watchPosition(
         (location) => {
-          const newPosition:
+          const currentPosition:
             Position = {
             lat:
               location.coords
@@ -584,7 +561,7 @@ export default function Home() {
           };
 
           setPosition(
-            newPosition
+            currentPosition
           );
 
           setLocationStatus(
@@ -604,16 +581,8 @@ export default function Home() {
         },
 
         {
-          enableHighAccuracy:
-            true,
-
+          enableHighAccuracy: true,
           timeout: 15000,
-
-          /*
-            Autorise une position récente
-            sans rappeler trop souvent
-            le GPS.
-          */
           maximumAge: 2000,
         }
       );
@@ -628,11 +597,13 @@ export default function Home() {
   const handleRoutesCalculated =
     useCallback(
       (routes: RouteInfo[]) => {
-        setRoutesInfo(
-          routes
-        );
+        setRoutesInfo(routes);
 
         setRouteError("");
+
+        setLastCalculation(
+          new Date()
+        );
       },
       []
     );
@@ -640,19 +611,90 @@ export default function Home() {
   const handleRouteError =
     useCallback(
       (message: string) => {
-        setRouteError(
-          message
-        );
+        setRouteError(message);
       },
       []
     );
 
+  const handleLoadingChange =
+    useCallback(
+      (loading: boolean) => {
+        setRouteLoading(loading);
+      },
+      []
+    );
+
+  /*
+    Fonction unique pour calculer
+    ou recalculer manuellement.
+  */
+  const requestRoute = () => {
+    if (
+      !position ||
+      !destination ||
+      routeLoading
+    ) {
+      return;
+    }
+
+    /*
+      Nouvelle position de départ.
+    */
+    setRouteStartPosition({
+      ...position,
+    });
+
+    setRouteError("");
+
+    setRouteRequestId(
+      (previous) =>
+        previous + 1
+    );
+  };
+
+  /*
+    Meilleur trajet.
+  */
+  const bestRoute =
+    routesInfo.length > 0
+      ? routesInfo[0]
+      : null;
+
+  /*
+    Heure d'arrivée.
+  */
+  let arrivalTime = "";
+
+  if (
+    bestRoute &&
+    lastCalculation
+  ) {
+    const arrival =
+      new Date(
+        lastCalculation.getTime() +
+          bestRoute.durationMinutes *
+            60 *
+            1000
+      );
+
+    arrivalTime =
+      arrival.toLocaleTimeString(
+        "fr-FR",
+        {
+          hour: "2-digit",
+          minute: "2-digit",
+        }
+      );
+  }
+
   if (!apiKey) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-gray-100">
+
         <p className="text-red-600">
           Clé Google Maps introuvable.
         </p>
+
       </main>
     );
   }
@@ -665,7 +707,8 @@ export default function Home() {
       ]}
     >
       <main className="min-h-screen bg-gray-100">
- <header className="bg-green-700 px-6 py-5 text-white shadow-md">
+
+        <header className="bg-green-700 px-6 py-5 text-white shadow-md">
 
           <div className="mx-auto max-w-6xl">
 
@@ -674,7 +717,8 @@ export default function Home() {
             </h1>
 
             <p className="text-sm text-green-100">
-              Évitez les embouteillages. Trouvez le meilleur trajet.
+              Évitez les embouteillages.
+              Trouvez le meilleur trajet.
             </p>
 
           </div>
@@ -691,8 +735,7 @@ export default function Home() {
 
             <h2 className="text-xl font-semibold text-gray-900">
 
-              📍{" "}
-              {locationStatus}
+              📍 {locationStatus}
 
             </h2>
 
@@ -721,7 +764,7 @@ export default function Home() {
             <DestinationSearch
               onPlaceSelected={(
                 place
-              ) => {
+ ) => {
                 setDestination({
                   name:
                     place.name,
@@ -737,11 +780,21 @@ export default function Home() {
 
                 setRouteError("");
 
+                setLastCalculation(
+                  null
+                );
+
+                setRouteStartPosition(
+                  null
+                );
+
                 setRouteRequestId(
                   0
                 );
               }}
             />
+
+
 
             {destination && (
               <div className="mt-4 rounded-xl bg-green-50 p-4">
@@ -767,110 +820,259 @@ export default function Home() {
 
               disabled={
                 !position ||
-                !destination
+                !destination ||
+                routeLoading
               }
 
-              onClick={() => {
-                setRouteError("");
-
-                /*
-                  Chaque clic force
-                  une vraie nouvelle
-                  recherche.
-                */
-                setRouteRequestId(
-                  (previous) =>
-                    previous + 1
-                );
-              }}
+              onClick={
+                requestRoute
+              }
 
               className="mt-4 w-full rounded-xl bg-green-700 p-4 font-semibold text-white hover:bg-green-800 disabled:cursor-not-allowed disabled:bg-gray-400"
             >
-              Rechercher un itinéraire
+
+              {routeLoading
+                ? "Calcul en cours..."
+                : routesInfo.length >
+                    0
+                  ? "Recalculer maintenant"
+                  : "Rechercher un itinéraire"}
+
             </button>
 
+{bestRoute?.steps?.[0] && (
+  <div className="mt-6 rounded-2xl border-2 border-green-600 bg-green-50 p-5">
+    
+    <p className="text-sm font-semibold text-green-700">
+      PROCHAINE INSTRUCTION
+    </p>
+
+    <div className="mt-3">
+      <p className="text-2xl font-bold text-gray-900">
+        {bestRoute.steps[0].instruction}
+      </p>
+
+      <p className="mt-2 text-lg font-semibold text-green-700">
+        dans{" "}
+        {bestRoute.steps[0].distanceMeters >= 1000
+          ? `${(bestRoute.steps[0].distanceMeters / 1000).toFixed(1)} km`
+          : `${Math.round(bestRoute.steps[0].distanceMeters)} m`}
+      </p>
+    </div>
+
+    {bestRoute?.steps?.[1] && (
+      <div className="mt-4 border-t border-green-200 pt-3">
+        <p className="text-sm text-gray-500">
+          Ensuite
+        </p>
+
+        <p className="font-semibold text-gray-700">
+          {bestRoute.steps[1].instruction}
+        </p>
+      </div>
+    )}
+
+  </div>
+)}
+
+            {(bestRoute?.steps?.length ?? 0) > 0 && (
+  <div className="mt-6 rounded-2xl bg-white p-5">
+    <h3 className="text-lg font-bold text-gray-900">
+      Instructions de navigation
+    </h3>
+
+    <div className="mt-4 space-y-3">
+      {bestRoute?.steps?.map((step, index) => (
+        <div
+          key={index}
+          className="rounded-xl border border-gray-200 p-4"
+        >
+          <p className="font-semibold text-gray-900">
+            {index + 1}. {step.instruction}
+          </p>
+
+          <p className="mt-1 text-sm text-gray-500">
+            {step.distanceMeters >= 1000
+              ? `${(step.distanceMeters / 1000).toFixed(1)} km`
+              : `${Math.round(step.distanceMeters)} m`}
+          </p>
+        </div>
+      ))}
+    </div>
+  </div>
+)}
+
+            {bestRoute && (
+              <div className="mt-6 rounded-2xl border-2 border-green-600 bg-green-50 p-6">
+
+                <p className="text-sm text-gray-500">
+                  Navigation vers
+                </p>
+
+                <h3 className="mt-1 text-xl font-bold text-gray-900">
+
+                  📍{" "}
+                  {
+                    destination?.name
+                  }
+
+                </h3>
+
+                <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
+
+                  <div className="rounded-xl bg-white p-4">
+
+                    <p className="text-sm text-gray-500">
+                      Temps restant
+                    </p>
+
+                    <p className="mt-1 text-2xl font-bold text-gray-900">
+
+                      🚗{" "}
+                      {Math.round(
+                        bestRoute.durationMinutes
+                      )}{" "}
+                      min
+
+                    </p>
+
+                  </div>
+
+                  <div className="rounded-xl bg-white p-4">
+
+                    <p className="text-sm text-gray-500">
+                      Distance restante
+                    </p>
+
+                    <p className="mt-1 text-2xl font-bold text-gray-900">
+
+                      📏{" "}
+                      {bestRoute.distanceKm.toFixed(
+                        1
+                      )}{" "}
+                      km
+
+                    </p>
+
+                  </div>
+
+                  <div className="rounded-xl bg-white p-4">
+
+                    <p className="text-sm text-gray-500">
+                      Arrivée estimée
+                    </p>
+
+                    <p className="mt-1 text-2xl font-bold text-gray-900">
+
+                      🕒{" "}
+                      {arrivalTime}
+
+                    </p>
+
+                  </div>
+
+                </div>
+
+                <p className="mt-4 font-medium text-green-700">
+                  🟢 Meilleur trajet selon le trafic actuel
+                </p>
+
+                <p className="mt-2 text-sm text-gray-600">
+
+                  {routesInfo.length -
+                    1}{" "}
+                  itinéraire
+                  {routesInfo.length -
+                    1 >
+                  1
+                    ? "s"
+                    : ""}{" "}
+                  alternatif
+                  {routesInfo.length -
+                    1 >
+ 1
+                    ? "s"
+                    : ""}
+
+                </p>
+
+                <p className="mt-1 text-xs text-gray-500">
+                  Distance et durée mises à jour lors du dernier calcul manuel.
+                </p>
+
+              </div>
+            )}
+
             {routesInfo.length >
-              0 && (
-              <div className="mt-6 space-y-4">
+              1 && (
+              <div className="mt-5 space-y-3">
 
-                {routesInfo.map(
-                  (
-                    route,
-                    index
-                  ) => {
-                    const bestRoute =
-                      routesInfo[0];
+                {routesInfo
+                  .slice(1)
+                  .map(
+                    (
+                      route,
+                      index
+                    ) => {
+                      const difference =
+                        route.durationMinutes -
+                        routesInfo[0]
+                          .durationMinutes;
 
-                    const extraMinutes =
-                      route.durationMinutes -
-                      bestRoute.durationMinutes;
+                      return (
+                        <div
+                          key={
+                            route.index
+                          }
 
-                    return (
-                      <div
-                        key={
-                          route.index
-                        }
+                          className="rounded-xl border border-gray-200 bg-gray-50 p-5"
+                        >
 
-                        className={
-                          index === 0
-                            ? "rounded-xl border-2 border-green-600 bg-green-50 p-5"
-                            : "rounded-xl border border-gray-200 bg-gray-50 p-5"
-                        }
-                      >
+                          <p className="text-sm text-gray-500">
 
-                        <p className="text-sm text-gray-500">
-
-                          {index === 0
-                            ? "Itinéraire recommandé"
-                            : `Alternative ${index}`}
-
-                        </p>
-<p className="mt-2 text-2xl font-bold text-gray-900">
-
-                          🚗{" "}
-                          {Math.round(
-                            route.durationMinutes
-                          )}{" "}
-                          min
-
-                        </p>
-
-                        <p className="mt-1 text-gray-700">
-
-                          📏{" "}
-                          {route.distanceKm.toFixed(
-                            1
-                          )}{" "}
-                          km
-
-                        </p>
-
-                        {index ===
-                        0 ? (
-                          <p className="mt-2 text-sm font-medium text-green-700">
-
-                            🟢 Meilleur trajet selon le trafic actuel
+                            Itinéraire alternatif{" "}
+                            {index +
+                              1}
 
                           </p>
-                        ) : (
+
+                          <p className="mt-2 text-xl font-bold text-gray-900">
+
+                            🚗{" "}
+                            {Math.round(
+                              route.durationMinutes
+                            )}{" "}
+                            min
+
+                          </p>
+
+                          <p className="mt-1 text-gray-700">
+
+                            📏{" "}
+                            {route.distanceKm.toFixed(
+                              1
+                            )}{" "}
+                            km
+
+                          </p>
+
                           <p className="mt-2 text-sm text-gray-600">
 
                             +
                             {Math.max(
                               0,
                               Math.round(
-                                extraMinutes
+                                difference
                               )
                             )}{" "}
                             min
 
                           </p>
-                        )}
 
-                      </div>
-                    );
-                  }
-                )}
+                        </div>
+                      );
+                    }
+                  )}
 
               </div>
             )}
@@ -882,6 +1084,45 @@ export default function Home() {
 
               </div>
             )}
+
+          </div>
+
+          <div className="mb-4 flex items-center justify-between rounded-xl bg-white p-4 shadow">
+
+            <div>
+
+              <p className="font-medium text-gray-900">
+                Suivi de la carte
+              </p>
+
+              <p className="text-sm text-gray-500">
+
+                {followPosition
+                  ? "La carte suit votre position."
+                  : "Déplacement libre sur la carte."}
+
+              </p>
+
+            </div>
+
+            <button
+              type="button"
+
+              onClick={() =>
+                setFollowPosition(
+                  (previous) =>
+                    !previous
+                )
+              }
+
+              className="rounded-lg bg-gray-900 px-4 py-2 text-sm font-semibold text-white"
+            >
+
+              {followPosition
+                ? "Désactiver"
+                : "Suivre ma position"}
+
+            </button>
 
           </div>
 
@@ -911,11 +1152,15 @@ export default function Home() {
                 position={
                   position
                 }
-              />
+
+                enabled={
+                  followPosition
+                }
+ />
 
               <RouteLayer
-                position={
-                  position
+                startPosition={
+                  routeStartPosition
                 }
 
                 destination={
@@ -933,6 +1178,10 @@ export default function Home() {
                 onRouteError={
                   handleRouteError
                 }
+
+                onLoadingChange={
+                  handleLoadingChange
+                }
               />
 
               {position && (
@@ -941,7 +1190,7 @@ export default function Home() {
                     position
                   }
 
-                  title="Votre position"
+                  title="Votre position actuelle"
                 />
               )}
 
